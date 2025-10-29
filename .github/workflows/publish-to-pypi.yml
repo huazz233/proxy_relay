@@ -1,0 +1,139 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如: 1.0.0)'
+        required: true
+        type: string
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/publish-to-pypi.yml'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    # 只在手动触发时运行
+    if: github.event_name == 'workflow_dispatch'
+
+    # 添加写入权限以便创建 Git 标签和 OIDC 权限用于 Trusted Publishing
+    permissions:
+      contents: write
+      id-token: write  # 启用 Trusted Publishing (OIDC)
+    
+    steps:
+    # 检出代码
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    # 设置 Python 环境
+    - name: 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    # 安装构建工具
+    - name: 安装构建工具
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+    
+    # 使用内联 Python 代码更新版本号（跨平台兼容）
+    - name: 更新版本号
+      shell: python
+      run: |
+        import re
+        import sys
+        from pathlib import Path
+        
+        version = "${{ github.event.inputs.version }}"
+        
+        # 验证版本号格式
+        if not re.match(r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$', version):
+            print(f"Error: Invalid version format: {version}")
+            print("Version must follow semantic versioning (e.g., 1.0.0 or 1.0.0-alpha)")
+            sys.exit(1)
+
+        print(f"Updating version to {version}...")
+        
+        # 定义需要更新的文件
+        files = [
+            ("proxy_relay/__init__.py", r'__version__\s*=\s*["\'][0-9\.\-a-zA-Z]+["\']', f'__version__ = "{version}"'),
+            ("setup.py", r'version\s*=\s*["\'][0-9\.\-a-zA-Z]+["\']', f'version="{version}"'),
+            ("pyproject.toml", r'version\s*=\s*["\'][0-9\.\-a-zA-Z]+["\']', f'version = "{version}"')
+        ]
+        
+        # 更新文件
+        success = 0
+        for file_path, pattern, replacement in files:
+            path = Path(file_path)
+            if path.exists():
+                content = path.read_text(encoding="utf-8")
+                new_content, count = re.subn(pattern, replacement, content)
+                if count > 0:
+                    path.write_text(new_content, encoding="utf-8")
+                    print(f"Updated {file_path}")
+                    success += 1
+                else:
+                    print(f"Warning: No match found in {file_path}")
+            else:
+                print(f"Warning: File not found: {file_path}")
+
+        if success == len(files):
+            print(f"Successfully updated {success} files")
+        else:
+            print(f"Error: Only {success}/{len(files)} files updated")
+            sys.exit(1)
+    
+    # 提交版本号更改
+    - name: 提交版本号更改
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add proxy_relay/__init__.py setup.py pyproject.toml
+        # 只在有变更时才提交
+        git diff --staged --quiet || git commit -m "v${{ github.event.inputs.version }}"
+    
+    # 构建分发包
+    - name: 构建分发包
+      run: |
+        python -m build
+        echo "Build completed"
+        ls -lh dist/
+
+    # 检查分发包
+    - name: 检查分发包
+      run: |
+        twine check dist/*
+        echo "Package validation passed"
+
+    # 发布到 PyPI (使用 Trusted Publishing)
+    - name: 发布到 PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+    
+    # 推送版本更新
+    - name: 推送版本更新
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        git tag -a "v$VERSION" -m "Release v$VERSION"
+        git push origin "v$VERSION"
+        git push
+
+    # 创建 GitHub Release
+    - name: 创建 GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.event.inputs.version }}
+        name: v${{ github.event.inputs.version }}
+        body: |
+          Released version ${{ github.event.inputs.version }} to PyPI
+
+          Install: `pip install proxy-relay==${{ github.event.inputs.version }}`
+        generate_release_notes: true
+        draft: false
+        prerelease: false
