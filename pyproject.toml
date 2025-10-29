@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proxy-relay"
+version = "1.0.0"
+description = "多协议代理中转器，支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "huazz233", email = "huazz233@163.com"}
+]
+keywords = ["proxy", "socks5", "http", "https", "relay", "asyncio", "protocol-conversion"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/huazz233/proxy_relay"
+Repository = "https://github.com/huazz233/proxy_relay"
+Issues = "https://github.com/huazz233/proxy_relay/issues"
+
+[tool.setuptools]
+packages = ["proxy_relay"]
+
+[tool.setuptools.package-data]
+proxy_relay = ["py.typed"]
+
