@@ -3,16 +3,17 @@
 [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-多协议代理中转器，支持 HTTP/HTTPS/SOCKS5/SOCKS5H 协议互转，本地代理无需账密认证。
+代理协议转换工具,支持 HTTP/HTTPS/SOCKS5/SOCKS5H 互转。
+
+**主要应用场景**: Playwright/Selenium 等自动化工具的代理中转
 
 ## 特性
 
-- **协议互转**: 支持 8 种协议组合 (HTTP/HTTPS/SOCKS5/SOCKS5H)
-- **无账密认证**: 本地代理无需配置账密，简化应用接入
-- 支持上游代理账密认证
-- 基于 asyncio 异步架构
-- 跨平台支持 (Windows/Linux/macOS)
-- 无外部依赖
+- 协议互转: 支持 8 种协议组合
+- 同步/异步API: 适配不同使用场景
+- 自动清理: 进程退出时自动释放资源
+- 线程安全: 支持多线程/多进程并发
+- 零依赖: 纯Python实现
 
 ## 安装
 
@@ -20,128 +21,153 @@
 pip install git+https://github.com/huazz233/proxy_relay.git
 ```
 
-开发模式：
+## 快速开始
 
-```bash
-git clone https://github.com/huazz233/proxy_relay.git
-cd proxy_relay
-pip install -e ".[dev]"
+```python
+from proxy_relay import create_proxy
+import requests
+
+# 创建本地代理
+url = create_proxy("socks5://user:pass@proxy.com:1080")
+
+# 使用代理
+resp = requests.get("https://api.ipify.org/", proxies={'http': url, 'https': url})
+print(resp.text)
 ```
 
-## 支持的协议组合
+## 使用场景
 
-| 上游协议 | 本地协议 | 描述 |
-|---------|---------|------|
-| HTTP | HTTP | HTTP上游 → HTTP本地 |
-| HTTP | SOCKS5 | HTTP上游 → SOCKS5本地 |
-| HTTPS | HTTP | HTTPS上游 → HTTP本地 |
-| HTTPS | SOCKS5 | HTTPS上游 → SOCKS5本地 |
-| SOCKS5 | HTTP | SOCKS5上游 → HTTP本地 |
-| SOCKS5 | SOCKS5 | SOCKS5上游 → SOCKS5本地 |
-| SOCKS5H | HTTP | SOCKS5H上游 → HTTP本地 |
-| SOCKS5H | SOCKS5 | SOCKS5H上游 → SOCKS5本地 |
-
-## 使用
+### 脚本/测试
 
 ```python
 from proxy_relay import create_proxy
 
-upstream_url = "socks5://username:password@proxy.example.com:1080"
-local_proxy_url = create_proxy(upstream_url, 'http')
-
-import requests
-proxies = {'http': local_proxy_url, 'https': local_proxy_url}
-response = requests.get('https://api.ipify.org/', proxies=proxies)
+url = create_proxy("http://proxy.com:8080")
+# 使用代理...
+# 进程退出时自动清理
 ```
 
-上下文管理器：
+### 长期运行服务
 
 ```python
-from proxy_relay import HttpProxy, Socks5Proxy
+from proxy_relay import create_proxy, cleanup
 
-with HttpProxy("socks5://user:pass@proxy.com:1080") as proxy:
-    local_url = proxy.get_local_url()
-
-with Socks5Proxy("http://proxy.com:8080") as proxy:
-    local_url = proxy.get_local_url()
+url = create_proxy("http://proxy.com:8080")
+# 使用代理...
+cleanup()  # 手动清理
 ```
 
-其他API：
+### 异步应用
 
 ```python
-from proxy_relay import create_http_proxy, create_socks5_proxy
-from proxy_relay import get_supported_protocols, get_version_info
+import asyncio
+from proxy_relay import create_proxy_async, HttpProxy
 
-http_proxy_url = create_http_proxy("socks5://proxy.com:1080")
-socks5_proxy_url = create_socks5_proxy("http://proxy.com:8080")
+async def main():
+    # 简单方式
+    url = await create_proxy_async("http://proxy.com:8080")
 
-protocols = get_supported_protocols()
-version = get_version_info()
-print(f"版本: {version['version']}")
-print(f"支持的上游协议: {protocols['upstream_protocols']}")
+    # 上下文管理器
+    async with HttpProxy("http://proxy.com:8080") as proxy:
+        url = proxy.get_local_url()
+        # 使用代理...
+
+asyncio.run(main())
 ```
 
-## 测试
-
-```bash
-python test_proxy_combinations.py
-```
-
-
-
-## API
-
-### create_proxy(upstream_url, local_type='http')
+### Playwright集成
 
 ```python
-proxy_url = create_proxy("socks5://proxy.com:1080", 'http')
-proxy_url = create_proxy("http://proxy.com:8080", 'socks5')
+import asyncio
+from proxy_relay import create_proxy_async
+from playwright.async_api import async_playwright
+
+async def main():
+    url = await create_proxy_async("socks5://user:pass@proxy.com:1080")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(proxy={"server": url})
+        page = await browser.new_page()
+        await page.goto('https://api.ipify.org/')
+        await browser.close()
+
+asyncio.run(main())
 ```
 
-### create_http_proxy(upstream_url)
+
+
+## API参考
+
+### 同步API
 
 ```python
-proxy_url = create_http_proxy("socks5://proxy.com:1080")
+# 创建代理
+create_proxy(upstream_url, local_type='http', connect_timeout=30.0, idle_timeout=300.0, timeout=30.0)
+create_http_proxy(upstream_url, ...)      # 快捷方法
+create_socks5_proxy(upstream_url, ...)    # 快捷方法
+
+# 清理代理 (可选,进程退出时自动清理)
+cleanup()
 ```
 
-### create_socks5_proxy(upstream_url)
+### 异步API
 
 ```python
-proxy_url = create_socks5_proxy("http://proxy.com:8080")
+# 创建代理
+await create_proxy_async(upstream_url, local_type='http', ...)
+await create_http_proxy_async(upstream_url, ...)
+await create_socks5_proxy_async(upstream_url, ...)
+
+# 上下文管理器
+async with HttpProxy(upstream_url) as proxy:
+    url = proxy.get_local_url()
+
+async with Socks5Proxy(upstream_url) as proxy:
+    url = proxy.get_local_url()
 ```
 
-### HttpProxy(upstream_url)
+### 高级API
 
 ```python
-with HttpProxy("socks5://proxy.com:1080") as proxy:
-    local_url = proxy.get_local_url()
+# ProxyManager - 管理多个代理
+with ProxyManager() as manager:
+    url = manager.create(upstream_url, local_type='http')
+    manager.stop(url)      # 停止单个
+    manager.stop_all()     # 停止所有
 ```
 
-### Socks5Proxy(upstream_url)
+## 支持的协议
 
-```python
-with Socks5Proxy("http://proxy.com:8080") as proxy:
-    local_url = proxy.get_local_url()
-```
+| 上游协议 | 本地协议 | 示例 |
+|---------|---------|------|
+| HTTP/HTTPS | HTTP/SOCKS5 | `http://proxy.com:8080` |
+| SOCKS5 | HTTP/SOCKS5 | `socks5://user:pass@proxy.com:1080` |
+| SOCKS5H | HTTP/SOCKS5 | `socks5h://proxy.com:1080` |
 
-## 配置
+## 参数说明
 
-超时参数：
+- `upstream_url`: 上游代理URL
+- `local_type`: 本地代理类型 (`'http'` 或 `'socks5'`)
+- `connect_timeout`: 连接超时(秒),默认30
+- `idle_timeout`: 空闲超时(秒),默认300
+- `timeout`: 创建超时(秒),默认30
 
-```python
-proxy_url = create_proxy("socks5://user:pass@proxy.com:1080", 'http',
-                        connect_timeout=60.0, idle_timeout=None)
-```
+## 多进程/多线程
 
-- `connect_timeout`: 连接超时，默认 30 秒
-- `idle_timeout`: 空闲超时，默认 300 秒
+- 完全线程安全
+- 多进程安全 (Windows/macOS默认spawn模式)
+- Linux fork模式: 建议在fork前不要创建代理
 
-## 调试
+## 常见问题
 
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-```
+**Q: 代理会一直运行吗?**
+A: 会,直到进程结束或手动调用 `cleanup()`
+
+**Q: 长期运行的服务如何避免资源累积?**
+A: 定期调用 `cleanup()` 或使用 `ProxyManager`
+
+**Q: 同步API和异步API有什么区别?**
+A: 同步API适合脚本,异步API适合异步应用(如FastAPI)
 
 ## 许可证
 
