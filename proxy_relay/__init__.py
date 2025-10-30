@@ -2,27 +2,67 @@
 """多协议代理中转器 - 支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证"""
 
 import asyncio
+import atexit
 import base64
-import logging
 import socket
 import struct
-import sys
 import threading
-import time
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 __version__ = "1.0.0"
 __author__ = "huazz233"
 
-logger = logging.getLogger(__name__)
+# 协议限制常量
+MAX_LINE_SIZE = 8192  # HTTP请求行最大长度
+MAX_DOMAIN_LEN = 255  # 域名最大长度(RFC1928)
 
 
-# 工具函数
+def extract_sni_from_client_hello(data: bytes) -> Optional[str]:
+    try:
+        data_len = len(data)
+        if data_len < 43 or data[0] != 0x16 or data[5] != 0x01:
+            return None
+
+        pos = 43
+        if pos >= data_len:
+            return None
+        pos += 1 + data[pos]
+
+        if pos + 2 > data_len:
+            return None
+        pos += 2 + int.from_bytes(data[pos:pos + 2], 'big')
+
+        if pos >= data_len:
+            return None
+        pos += 1 + data[pos]
+
+        if pos + 2 > data_len:
+            return None
+        extensions_end = pos + 2 + int.from_bytes(data[pos:pos + 2], 'big')
+        pos += 2
+
+        while pos + 4 <= data_len and pos < extensions_end:
+            ext_type = int.from_bytes(data[pos:pos + 2], 'big')
+            ext_len = int.from_bytes(data[pos + 2:pos + 4], 'big')
+            pos += 4
+
+            if ext_type == 0 and pos + ext_len <= data_len:
+                if pos + 5 <= data_len and data[pos + 2] == 0:
+                    name_len = int.from_bytes(data[pos + 3:pos + 5], 'big')
+                    if pos + 5 + name_len <= data_len:
+                        return data[pos + 5:pos + 5 + name_len].decode('ascii', errors='ignore')
+                return None
+
+            pos += ext_len
+
+        return None
+    except Exception:
+        return None
+
 
 def find_free_port() -> int:
-    """获取空闲端口"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('127.0.0.1', 0))
         s.listen(1)
@@ -30,10 +70,20 @@ def find_free_port() -> int:
 
 
 def parse_proxy_url(url: str) -> Dict[str, Any]:
-    """解析代理URL"""
     parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in ['http', 'https', 'socks5', 'socks5h']:
+        raise ValueError(f"不支持的协议: {scheme}")
+
+    if not parsed.hostname or not parsed.port:
+        raise ValueError(f"无效的代理URL: {url}")
+
+    if not (1 <= parsed.port <= 65535):
+        raise ValueError(f"无效的端口: {parsed.port}")
+
     return {
-        'scheme': parsed.scheme.lower(),
+        'scheme': scheme,
         'host': parsed.hostname,
         'port': parsed.port,
         'username': parsed.username,
@@ -41,53 +91,34 @@ def parse_proxy_url(url: str) -> Dict[str, Any]:
     }
 
 
-def validate_proxy_config(config: Dict[str, Any]) -> bool:
-    """验证代理配置"""
-    required_fields = ['scheme', 'host', 'port']
-    
-    for field in required_fields:
-        if field not in config or config[field] is None:
-            logger.error(f"代理配置缺少必需字段: {field}")
-            return False
-    
-    supported_schemes = ['http', 'https', 'socks5', 'socks5h']
-    if config['scheme'] not in supported_schemes:
-        logger.error(f"不支持的代理协议: {config['scheme']}")
-        return False
-    
-    if not (1 <= config['port'] <= 65535):
-        logger.error(f"无效的端口号: {config['port']}")
-        return False
-    
-    return True
-
-
 def is_socks_scheme(scheme: str) -> bool:
-    """判断是否为SOCKS协议"""
-    return scheme.lower() in ['socks5', 'socks5h']
+    return scheme in ['socks5', 'socks5h']
 
-
-# 异常类
 
 class ProxyError(Exception):
-    """代理异常"""
     pass
 
 
 class UpstreamConnectionError(ProxyError):
-    """上游连接异常"""
     pass
 
 
 class ClientConnectionError(ProxyError):
-    """客户端连接异常"""
     pass
 
 
-# 辅助函数
+async def _read_exact(reader: asyncio.StreamReader, n: int, timeout: Optional[float] = None):
+    try:
+        if timeout:
+            return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
+        return await reader.readexactly(n)
+    except asyncio.TimeoutError:
+        raise ClientConnectionError(f"读取{n}字节超时")
+    except asyncio.IncompleteReadError:
+        raise ClientConnectionError(f"连接意外关闭,期望{n}字节")
+
 
 async def connect_upstream(host: str, port: int, timeout: Optional[float] = None):
-    """连接上游代理"""
     try:
         if timeout:
             return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -98,96 +129,78 @@ async def connect_upstream(host: str, port: int, timeout: Optional[float] = None
         raise UpstreamConnectionError(f"连接失败 {host}:{port} - {e}")
 
 
-async def send_http_connect(upstream_reader, upstream_writer, target_host: str, target_port: int, auth_config: dict = None) -> bool:
-    """发送HTTP CONNECT请求"""
+async def send_http_connect(upstream_reader, upstream_writer, target_host: str, target_port: int,
+                            auth_config: dict = None, timeout: float = 10.0) -> bool:
     request = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-    
+
     if auth_config and auth_config.get('username') and auth_config.get('password'):
         auth_str = f"{auth_config['username']}:{auth_config['password']}"
         auth_header = base64.b64encode(auth_str.encode()).decode()
         request += f"Proxy-Authorization: Basic {auth_header}\r\n"
-    
+
     request += "\r\n"
     upstream_writer.write(request.encode())
     await upstream_writer.drain()
 
-    response_line = await upstream_reader.readline()
-    if not response_line:
-        raise UpstreamConnectionError("上游无响应")
+    async def read_response():
+        response_line = await upstream_reader.readline()
+        if not response_line:
+            raise UpstreamConnectionError("上游无响应")
+        if len(response_line) > MAX_LINE_SIZE:
+            raise UpstreamConnectionError(f"HTTP响应行过长: {len(response_line)} > {MAX_LINE_SIZE}")
 
-    response = response_line.decode('utf-8', errors='ignore').strip()
+        response = response_line.decode('utf-8', errors='ignore').strip()
 
-    while True:
-        line = await upstream_reader.readline()
-        if not line or line == b'\r\n':
-            break
+        while True:
+            line = await upstream_reader.readline()
+            if len(line) > MAX_LINE_SIZE:
+                raise UpstreamConnectionError(f"HTTP响应行过长: {len(line)} > {MAX_LINE_SIZE}")
+            if not line or line == b'\r\n':
+                break
 
-    if "200" not in response:
-        raise UpstreamConnectionError(f"CONNECT失败: {response}")
+        if "200" not in response:
+            raise UpstreamConnectionError(f"CONNECT失败: {response}")
 
-    return True
+        return True
 
+    try:
+        return await asyncio.wait_for(read_response(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise UpstreamConnectionError(f"HTTP CONNECT超时({timeout}s)")
 
-# 基类
 
 class BaseProxy(ABC):
-    """代理基类"""
 
-    def __init__(self, upstream_url: str, connect_timeout: Optional[float] = 30.0, idle_timeout: Optional[float] = 300.0):
+    def __init__(self, upstream_url: str, connect_timeout: Optional[float] = 30.0,
+                 idle_timeout: Optional[float] = 300.0):
         self.upstream_config = parse_proxy_url(upstream_url)
-
-        if not validate_proxy_config(self.upstream_config):
-            raise ValueError(f"无效的上游代理配置: {upstream_url}")
-
         self.local_port = find_free_port()
         self.local_host = '127.0.0.1'
         self.running = False
-        self._server_thread = None
+        self._server = None
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
 
-    def start(self) -> str:
+    async def start(self) -> str:
         if self.running:
             return self.get_local_url()
 
         self.running = True
-        self._server_thread = threading.Thread(target=self._run_server, daemon=True)
-        self._server_thread.start()
-        time.sleep(0.5)
-
-        logger.info(f"代理启动: {self.get_local_url()}")
-        return self.get_local_url()
-
-    def stop(self):
-        if not self.running:
-            return
-        self.running = False
-        logger.info("代理停止")
-
-    def _run_server(self):
-        try:
-            if sys.platform == 'win32':
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._async_server())
-            finally:
-                loop.close()
-        except Exception as e:
-            logger.error(f"服务器出错: {e}")
-            self.running = False
-
-    async def _async_server(self):
-        server = await asyncio.start_server(
+        self._server = await asyncio.start_server(
             self._handle_client,
             self.local_host,
             self.local_port
         )
+        return self.get_local_url()
 
-        async with server:
-            await server.serve_forever()
+    async def stop(self):
+        if not self.running:
+            return
+
+        self.running = False
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
 
     @abstractmethod
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -229,12 +242,13 @@ class BaseProxy(ABC):
             return_exceptions=True
         )
 
-    def __enter__(self):
-        self.start()
+    async def __aenter__(self):
+        await self.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
+        await self.stop()
+        return False
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.get_local_url()})"
@@ -246,10 +260,53 @@ class BaseProxy(ABC):
                 f"running={self.running})")
 
 
-# HTTP代理实现
+def _create_proxy_instance(upstream_url: str, local_type: str, connect_timeout: float, idle_timeout: float):
+    if not upstream_url:
+        raise ValueError("上游代理URL不能为空")
+
+    if local_type not in ['http', 'socks5']:
+        raise ValueError(f"不支持的本地代理类型: {local_type}")
+
+    if local_type == 'http':
+        return HttpProxy(upstream_url, connect_timeout=connect_timeout, idle_timeout=idle_timeout)
+    else:
+        return Socks5Proxy(upstream_url, connect_timeout=connect_timeout, idle_timeout=idle_timeout)
+
+
+class ProxyManager:
+
+    def __init__(self):
+        self._proxies = {}
+
+    async def create(self, upstream_url: str, local_type: str = 'http',
+                     connect_timeout: float = 30.0, idle_timeout: float = 300.0) -> str:
+        proxy = _create_proxy_instance(upstream_url, local_type, connect_timeout, idle_timeout)
+        local_url = await proxy.start()
+        self._proxies[local_url] = proxy
+        return local_url
+
+    async def stop(self, local_url: str):
+        proxy = self._proxies.pop(local_url, None)
+        if proxy:
+            await proxy.stop()
+
+    async def stop_all(self):
+        for proxy in self._proxies.values():
+            await proxy.stop()
+        self._proxies.clear()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
+        await self.stop_all()
+        return False
+
+    def __repr__(self):
+        return f"ProxyManager(active_proxies={len(self._proxies)})"
+
 
 class HttpProxy(BaseProxy):
-    """HTTP代理"""
 
     def get_local_url(self) -> str:
         return f"http://{self.local_host}:{self.local_port}"
@@ -275,19 +332,18 @@ class HttpProxy(BaseProxy):
             else:
                 await self._handle_http_request(reader, writer, request_line)
 
-        except Exception as e:
-            logger.error(f"HTTP客户端出错: {e}")
+        except Exception:
             try:
                 writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
                 await writer.drain()
-            except:
+            except Exception:
                 pass
         finally:
             try:
                 if not writer.is_closing():
                     writer.close()
                     await writer.wait_closed()
-            except:
+            except Exception:
                 pass
 
     async def _handle_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: str):
@@ -301,26 +357,33 @@ class HttpProxy(BaseProxy):
             )
 
             await send_http_connect(
-                upstream_reader, upstream_writer, target_host, target_port, self.upstream_config
+                upstream_reader, upstream_writer, target_host, target_port,
+                self.upstream_config, self.connect_timeout
             )
 
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
 
-            # 跳过客户端请求头
-            while True:
-                line = await reader.readline()
-                if not line or line == b'\r\n':
-                    break
+            async def skip_headers():
+                while True:
+                    line = await reader.readline()
+                    if len(line) > MAX_LINE_SIZE:
+                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+                    if not line or line == b'\r\n':
+                        break
+
+            try:
+                await asyncio.wait_for(skip_headers(), timeout=self.connect_timeout)
+            except asyncio.TimeoutError:
+                raise ClientConnectionError("读取客户端请求头超时")
 
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
 
-        except Exception as e:
-            logger.error(f"CONNECT出错: {e}")
+        except Exception:
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
-            except:
+            except Exception:
                 pass
 
     async def _handle_http_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -332,35 +395,42 @@ class HttpProxy(BaseProxy):
 
             upstream_writer.write(request_line)
 
-            auth_added = False
-            while True:
-                line = await reader.readline()
-                if line == b'\r\n':
-                    if not auth_added and self.upstream_config.get('username') and self.upstream_config.get('password'):
-                        auth_str = f"{self.upstream_config['username']}:{self.upstream_config['password']}"
-                        auth_header = base64.b64encode(auth_str.encode()).decode()
-                        upstream_writer.write(f"Proxy-Authorization: Basic {auth_header}\r\n".encode())
+            async def forward_headers():
+                auth_added = False
+                while True:
+                    line = await reader.readline()
+                    if len(line) > MAX_LINE_SIZE:
+                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+
+                    if line == b'\r\n':
+                        if not auth_added and self.upstream_config.get('username') and self.upstream_config.get(
+                                'password'):
+                            auth_str = f"{self.upstream_config['username']}:{self.upstream_config['password']}"
+                            auth_header = base64.b64encode(auth_str.encode()).decode()
+                            upstream_writer.write(f"Proxy-Authorization: Basic {auth_header}\r\n".encode())
+                        upstream_writer.write(line)
+                        break
+
+                    if line.lower().startswith(b'proxy-authorization:'):
+                        auth_added = True
+
                     upstream_writer.write(line)
-                    break
 
-                if line.lower().startswith(b'proxy-authorization:'):
-                    auth_added = True
-
-                upstream_writer.write(line)
+            try:
+                await asyncio.wait_for(forward_headers(), timeout=self.connect_timeout)
+            except asyncio.TimeoutError:
+                raise ClientConnectionError("读取客户端请求头超时")
 
             await upstream_writer.drain()
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
 
-        except Exception as e:
-            logger.error(f"HTTP请求出错: {e}")
+        except Exception:
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
-            except:
+            except Exception:
                 pass
 
-
-# SOCKS5代理实现
 
 class Socks5Proxy(BaseProxy):
     """SOCKS5代理,支持双协议"""
@@ -370,21 +440,21 @@ class Socks5Proxy(BaseProxy):
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            initial_data = await reader.readexactly(1)
+            initial_data = await _read_exact(reader, 1, self.connect_timeout)
 
             if initial_data and initial_data[0] == 0x05:
                 await self._handle_socks5(reader, writer, initial_data)
             else:
                 await self._handle_http(reader, writer, initial_data)
 
-        except Exception as e:
-            logger.error(f"客户端出错: {e}")
+        except Exception:
+            pass
         finally:
             try:
                 if not writer.is_closing():
                     writer.close()
                     await writer.wait_closed()
-            except:
+            except Exception:
                 pass
 
     async def _handle_socks5(self, reader, writer, initial_data):
@@ -392,43 +462,72 @@ class Socks5Proxy(BaseProxy):
             if initial_data[0] != 0x05:
                 return
 
-            nmethods = (await reader.readexactly(1))[0]
-            await reader.readexactly(nmethods)
+            nmethods = (await _read_exact(reader, 1, self.connect_timeout))[0]
+            await _read_exact(reader, nmethods, self.connect_timeout)
 
             writer.write(b'\x05\x00')
             await writer.drain()
 
-            ver, cmd, _, atyp = await reader.readexactly(4)
+            ver, cmd, _, atyp = await _read_exact(reader, 4, self.connect_timeout)
 
             if ver != 0x05 or cmd != 0x01:
                 writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
                 await writer.drain()
                 return
 
-            target_host, target_port = await self._parse_address(reader, atyp)
+            target_host, target_port, addr_type = await self._parse_address(reader, atyp)
             if not target_host:
                 writer.write(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
                 await writer.drain()
                 return
 
-            upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
+            first_packet = None
+            if addr_type in (0x01, 0x04):
+                writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+                await writer.drain()
 
-            writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
-            await writer.drain()
+                try:
+                    first_packet = await asyncio.wait_for(reader.read(8192), timeout=self.connect_timeout)
+                    if first_packet:
+                        sni_domain = extract_sni_from_client_hello(first_packet)
+                        if sni_domain:
+                            target_host = sni_domain
+                except Exception:
+                    pass
+
+            try:
+                upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
+            except Exception:
+                if not first_packet:
+                    writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+                    await writer.drain()
+                return
+
+            if not first_packet:
+                writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+                await writer.drain()
+            else:
+                try:
+                    upstream_writer.write(first_packet)
+                    await upstream_writer.drain()
+                except Exception:
+                    return
 
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
 
-        except Exception as e:
-            logger.error(f"SOCKS5出错: {e}")
+        except Exception:
             try:
                 writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
                 await writer.drain()
-            except:
+            except Exception:
                 pass
 
     async def _handle_http(self, reader, writer, initial_data):
         try:
             request_line_bytes = initial_data + await reader.readline()
+            if len(request_line_bytes) > MAX_LINE_SIZE:
+                raise ClientConnectionError(f"HTTP请求行过长: {len(request_line_bytes)} > {MAX_LINE_SIZE}")
+
             request_line = request_line_bytes.decode('utf-8', errors='ignore').strip()
             parts = request_line.split()
 
@@ -440,11 +539,18 @@ class Socks5Proxy(BaseProxy):
             target_host, target_port_str = parts[1].split(':', 1)
             target_port = int(target_port_str)
 
-            # 跳过请求头
-            while True:
-                line = await reader.readline()
-                if not line or line == b'\r\n':
-                    break
+            async def skip_request_headers():
+                while True:
+                    line = await reader.readline()
+                    if len(line) > MAX_LINE_SIZE:
+                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+                    if not line or line == b'\r\n':
+                        break
+
+            try:
+                await asyncio.wait_for(skip_request_headers(), timeout=self.connect_timeout)
+            except asyncio.TimeoutError:
+                raise ClientConnectionError("读取客户端请求头超时")
 
             upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
 
@@ -453,32 +559,33 @@ class Socks5Proxy(BaseProxy):
 
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
 
-        except Exception as e:
-            logger.error(f"HTTP出错: {e}")
+        except Exception:
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
-            except:
+            except Exception:
                 pass
 
     async def _parse_address(self, reader, atyp: int) -> Tuple[str, int]:
         try:
             if atyp == 0x01:  # IPv4
-                addr_bytes = await reader.readexactly(4)
+                addr_bytes = await _read_exact(reader, 4, self.connect_timeout)
                 target_host = socket.inet_ntoa(addr_bytes)
             elif atyp == 0x03:  # 域名
-                addr_len = (await reader.readexactly(1))[0]
-                target_host = (await reader.readexactly(addr_len)).decode('ascii')
+                addr_len = (await _read_exact(reader, 1, self.connect_timeout))[0]
+                if addr_len > MAX_DOMAIN_LEN:
+                    raise ProxyError(f"域名长度超限: {addr_len} > {MAX_DOMAIN_LEN}")
+                target_host = (await _read_exact(reader, addr_len, self.connect_timeout)).decode('ascii')
             elif atyp == 0x04:  # IPv6
-                addr_bytes = await reader.readexactly(16)
+                addr_bytes = await _read_exact(reader, 16, self.connect_timeout)
                 target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
             else:
                 return None, None
 
-            target_port = struct.unpack('>H', await reader.readexactly(2))[0]
-            return target_host, target_port
+            target_port = struct.unpack('>H', await _read_exact(reader, 2, self.connect_timeout))[0]
+            return target_host, target_port, atyp
         except Exception:
-            return None, None
+            return None, None, None
 
     async def _connect_upstream(self, target_host: str, target_port: int):
         if is_socks_scheme(self.upstream_config['scheme']):
@@ -492,7 +599,8 @@ class Socks5Proxy(BaseProxy):
         upstream_reader, upstream_writer = await connect_upstream(
             self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
         )
-        await send_http_connect(upstream_reader, upstream_writer, target_host, target_port, self.upstream_config)
+        await send_http_connect(upstream_reader, upstream_writer, target_host, target_port, self.upstream_config,
+                                self.connect_timeout)
         return upstream_reader, upstream_writer
 
     async def _connect_socks5(self, target_host: str, target_port: int):
@@ -500,7 +608,6 @@ class Socks5Proxy(BaseProxy):
             self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
         )
 
-        # 握手
         auth_methods = [0x00]
         if self.upstream_config.get('username') and self.upstream_config.get('password'):
             auth_methods.append(0x02)
@@ -508,140 +615,167 @@ class Socks5Proxy(BaseProxy):
         upstream_writer.write(b'\x05' + bytes([len(auth_methods)]) + bytes(auth_methods))
         await upstream_writer.drain()
 
-        ver, chosen_method = await upstream_reader.readexactly(2)
+        ver, chosen_method = await _read_exact(upstream_reader, 2, self.connect_timeout)
         if ver != 0x05 or chosen_method == 0xFF:
             raise UpstreamConnectionError("SOCKS5握手失败")
 
-        # 认证
         if chosen_method == 0x02:
             username = self.upstream_config['username'].encode('utf-8')
             password = self.upstream_config['password'].encode('utf-8')
+
+            if len(username) > MAX_DOMAIN_LEN:
+                raise ProxyError(f"用户名长度超限: {len(username)} > {MAX_DOMAIN_LEN}")
+            if len(password) > MAX_DOMAIN_LEN:
+                raise ProxyError(f"密码长度超限: {len(password)} > {MAX_DOMAIN_LEN}")
+
             upstream_writer.write(b'\x01' + bytes([len(username)]) + username + bytes([len(password)]) + password)
             await upstream_writer.drain()
 
-            ver, status = await upstream_reader.readexactly(2)
+            ver, status = await _read_exact(upstream_reader, 2, self.connect_timeout)
             if ver != 0x01 or status != 0x00:
                 raise UpstreamConnectionError("SOCKS5认证失败")
 
-        # 连接请求
         req = bytearray(b'\x05\x01\x00')
 
+        is_ipv4 = False
+        is_ipv6 = False
         try:
-            if hasattr(socket, 'inet_pton'):
-                ip_bytes = socket.inet_pton(socket.AF_INET, target_host)
-                req.append(0x01)
-                req.extend(ip_bytes)
-            else:
-                ip_bytes = socket.inet_aton(target_host)
-                req.append(0x01)
-                req.extend(ip_bytes)
-        except (socket.error, OSError):
+            socket.inet_pton(socket.AF_INET, target_host)
+            is_ipv4 = True
+        except (socket.error, OSError, AttributeError):
             try:
-                if hasattr(socket, 'inet_pton'):
-                    ip_bytes = socket.inet_pton(socket.AF_INET6, target_host)
-                    req.append(0x04)
-                    req.extend(ip_bytes)
-                else:
-                    raise socket.error("IPv6 not supported")
-            except (socket.error, OSError):
-                req.append(0x03)
-                req.append(len(target_host))
-                req.extend(target_host.encode('ascii'))
+                socket.inet_pton(socket.AF_INET6, target_host)
+                is_ipv6 = True
+            except (socket.error, OSError, AttributeError):
+                pass
+
+        if is_ipv4:
+            req.append(0x01)
+            req.extend(socket.inet_pton(socket.AF_INET, target_host))
+        elif is_ipv6:
+            req.append(0x04)
+            req.extend(socket.inet_pton(socket.AF_INET6, target_host))
+        else:
+            if len(target_host) > MAX_DOMAIN_LEN:
+                raise ProxyError(f"目标域名长度超限: {len(target_host)} > {MAX_DOMAIN_LEN}")
+            req.append(0x03)
+            req.append(len(target_host))
+            req.extend(target_host.encode('ascii'))
 
         req.extend(target_port.to_bytes(2, 'big'))
         upstream_writer.write(req)
         await upstream_writer.drain()
 
-        response = await upstream_reader.readexactly(10)
+        response = await _read_exact(upstream_reader, 10, self.connect_timeout)
         if response[1] != 0x00:
             raise UpstreamConnectionError(f"SOCKS5连接失败: {response[1]}")
 
         return upstream_reader, upstream_writer
 
 
-# 公共API
+_background_loop = None
+_background_thread = None
+_loop_lock = threading.Lock()
+_proxy_registry = {}
+_registry_lock = threading.Lock()
 
-def create_proxy(upstream_url: str, local_type: str = 'http', connect_timeout: float = 30.0, idle_timeout: float = 300.0) -> str:
-    """创建代理并返回本地URL"""
-    if not upstream_url:
-        raise ValueError("上游代理URL不能为空")
 
-    if local_type not in ['http', 'socks5']:
-        raise ValueError(f"不支持的本地代理类型: {local_type}")
+def _get_background_loop():
+    global _background_loop, _background_thread
 
+    with _loop_lock:
+        if _background_loop is None or not _background_loop.is_running():
+            _background_loop = asyncio.new_event_loop()
+
+            def run_loop():
+                asyncio.set_event_loop(_background_loop)
+                _background_loop.run_forever()
+
+            _background_thread = threading.Thread(target=run_loop, daemon=True)
+            _background_thread.start()
+
+        return _background_loop
+
+
+def _run_async(coro, timeout=None):
+    loop = _get_background_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
-        upstream_config = parse_proxy_url(upstream_url)
-    except Exception as e:
-        raise ValueError(f"解析上游代理URL失败: {e}")
-
-    if not validate_proxy_config(upstream_config):
-        raise ValueError(f"无效的上游代理配置: {upstream_url}")
-
-    try:
-        if local_type == 'http':
-            proxy = HttpProxy(upstream_url, connect_timeout=connect_timeout, idle_timeout=idle_timeout)
-        elif local_type == 'socks5':
-            proxy = Socks5Proxy(upstream_url, connect_timeout=connect_timeout, idle_timeout=idle_timeout)
-        else:
-            raise ValueError(f"未处理的本地代理类型: {local_type}")
-
-        local_url = proxy.start()
-        logger.debug(f"代理创建成功: {upstream_url} -> {local_url}")
-        return local_url
-
-    except Exception as e:
-        logger.error(f"创建代理失败: {e}")
-        raise ProxyError(f"创建代理失败: {e}")
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        future.cancel()
+        raise ProxyError(f"操作超时({timeout}s)")
 
 
-def create_http_proxy(upstream_url: str, connect_timeout: float = 30.0, idle_timeout: float = 300.0) -> str:
-    """创建HTTP本地代理"""
-    return create_proxy(upstream_url, 'http', connect_timeout=connect_timeout, idle_timeout=idle_timeout)
+async def create_proxy_async(upstream_url: str, local_type: str = 'http', connect_timeout: float = 30.0,
+                             idle_timeout: float = 300.0) -> str:
+    proxy = _create_proxy_instance(upstream_url, local_type, connect_timeout, idle_timeout)
+    local_url = await proxy.start()
+
+    with _registry_lock:
+        _proxy_registry[local_url] = proxy
+
+    return local_url
 
 
-def create_socks5_proxy(upstream_url: str, connect_timeout: float = 30.0, idle_timeout: float = 300.0) -> str:
-    """创建SOCKS5本地代理"""
-    return create_proxy(upstream_url, 'socks5', connect_timeout=connect_timeout, idle_timeout=idle_timeout)
+async def create_http_proxy_async(upstream_url: str, connect_timeout: float = 30.0, idle_timeout: float = 300.0) -> str:
+    return await create_proxy_async(upstream_url, 'http', connect_timeout=connect_timeout, idle_timeout=idle_timeout)
 
 
-def get_supported_protocols() -> dict:
-    """返回支持的协议组合"""
-    return {
-        "upstream_protocols": ["http", "https", "socks5", "socks5h"],
-        "local_protocols": ["http", "socks5"],
-        "combinations": [
-            {"upstream": "http", "local": "http", "description": "HTTP上游 → HTTP本地"},
-            {"upstream": "http", "local": "socks5", "description": "HTTP上游 → SOCKS5本地"},
-            {"upstream": "https", "local": "http", "description": "HTTPS上游 → HTTP本地"},
-            {"upstream": "https", "local": "socks5", "description": "HTTPS上游 → SOCKS5本地"},
-            {"upstream": "socks5", "local": "http", "description": "SOCKS5上游 → HTTP本地"},
-            {"upstream": "socks5", "local": "socks5", "description": "SOCKS5上游 → SOCKS5本地"},
-            {"upstream": "socks5h", "local": "http", "description": "SOCKS5H上游 → HTTP本地"},
-            {"upstream": "socks5h", "local": "socks5", "description": "SOCKS5H上游 → SOCKS5本地"},
-        ]
-    }
+async def create_socks5_proxy_async(upstream_url: str, connect_timeout: float = 30.0,
+                                    idle_timeout: float = 300.0) -> str:
+    return await create_proxy_async(upstream_url, 'socks5', connect_timeout=connect_timeout, idle_timeout=idle_timeout)
 
 
-def get_version_info() -> dict:
-    """返回版本信息"""
-    return {
-        "version": __version__,
-        "author": __author__,
-        "description": "多协议代理中转器，支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转"
-    }
+def create_proxy(upstream_url: str, local_type: str = 'http', connect_timeout: float = 30.0,
+                 idle_timeout: float = 300.0, timeout: float = 30.0) -> str:
+    return _run_async(create_proxy_async(upstream_url, local_type, connect_timeout, idle_timeout), timeout=timeout)
 
+
+def create_http_proxy(upstream_url: str, connect_timeout: float = 30.0, idle_timeout: float = 300.0,
+                      timeout: float = 30.0) -> str:
+    return create_proxy(upstream_url, 'http', connect_timeout=connect_timeout, idle_timeout=idle_timeout,
+                        timeout=timeout)
+
+
+def create_socks5_proxy(upstream_url: str, connect_timeout: float = 30.0, idle_timeout: float = 300.0,
+                        timeout: float = 30.0) -> str:
+    return create_proxy(upstream_url, 'socks5', connect_timeout=connect_timeout, idle_timeout=idle_timeout,
+                        timeout=timeout)
+
+
+def cleanup():
+    """清理所有代理资源。
+
+    通常不需要手动调用,进程结束时会自动清理。
+    仅在长期运行的服务中需要手动清理时使用。
+    """
+    with _registry_lock:
+        proxies = list(_proxy_registry.values())
+        _proxy_registry.clear()
+
+    for proxy in proxies:
+        try:
+            _run_async(proxy.stop(), timeout=10.0)
+        except Exception:
+            pass
+
+
+atexit.register(cleanup)
 
 __all__ = [
     'create_proxy',
     'create_http_proxy',
     'create_socks5_proxy',
-    'get_supported_protocols',
-    'get_version_info',
+    'create_proxy_async',
+    'create_http_proxy_async',
+    'create_socks5_proxy_async',
+    'cleanup',
     'HttpProxy',
     'Socks5Proxy',
     'BaseProxy',
+    'ProxyManager',
     'ProxyError',
     'UpstreamConnectionError',
     'ClientConnectionError'
 ]
-

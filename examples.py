@@ -1,62 +1,66 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import requests
-from proxy_relay import create_proxy, HttpProxy, Socks5Proxy
+
+from proxy_relay import create_proxy
+
+PROXY_ADDR = "user:pass@proxy.example.com:1080"
+# TEST_URL = "http://208.95.112.1/json/"
+TEST_URL = "https://api.ipify.org/"
+TIMEOUT = 30
+
+
+def get_direct_ip():
+    try:
+        return requests.get(TEST_URL, timeout=TIMEOUT).text.strip()
+    except:
+        return None
+
+
+def test_proxy(local_url):
+    try:
+        proxies = {'http': local_url, 'https': local_url}
+        return requests.get(TEST_URL, proxies=proxies, timeout=TIMEOUT).text.strip()
+    except:
+        return None
 
 
 def main():
-    # 基本用法
-    upstream = "socks5://user:pass@proxy.example.com:1080"
-    local_url = create_proxy(upstream, 'http')
-    print(f"代理启动: {local_url}")
-
-    # 使用代理发送请求
-    proxies = {'http': local_url, 'https': local_url}
-    try:
-        resp = requests.get('https://api.ipify.org/', proxies=proxies, timeout=10)
-        print(f"当前IP: {resp.text.strip()}")
-    except Exception as e:
-        print(f"请求失败: {e}")
-
-    # 上下文管理器 - 自动管理生命周期
-    with HttpProxy(upstream) as proxy:
-        print(f"临时代理: {proxy.get_local_url()}")
-        # 代理会在退出 with 块时自动停止
-
-    # SOCKS5 本地代理
-    with Socks5Proxy(upstream) as proxy:
-        print(f"SOCKS5代理: {proxy.get_local_url()}")
-
-    # 支持的协议组合
-    print("\n支持的协议组合:")
     combinations = [
-        ("http://proxy.com:8080", "http", "HTTP → HTTP"),
-        ("http://proxy.com:8080", "socks5", "HTTP → SOCKS5"),
-        ("https://proxy.com:8080", "http", "HTTPS → HTTP"),
-        ("https://proxy.com:8080", "socks5", "HTTPS → SOCKS5"),
-        ("socks5://proxy.com:1080", "http", "SOCKS5 → HTTP"),
-        ("socks5://proxy.com:1080", "socks5", "SOCKS5 → SOCKS5"),
-        ("socks5h://proxy.com:1080", "http", "SOCKS5H → HTTP"),
-        ("socks5h://proxy.com:1080", "socks5", "SOCKS5H → SOCKS5"),
+        ("http", "http", "HTTP->HTTP"),
+        ("http", "socks5", "HTTP->SOCKS5"),
+        ("https", "http", "HTTPS->HTTP"),
+        ("https", "socks5", "HTTPS->SOCKS5"),
+        ("socks5", "http", "SOCKS5->HTTP"),
+        ("socks5", "socks5", "SOCKS5->SOCKS5"),
+        ("socks5h", "http", "SOCKS5H->HTTP"),
+        ("socks5h", "socks5", "SOCKS5H->SOCKS5"),
     ]
 
-    for upstream, local_type, desc in combinations:
+    direct_ip = get_direct_ip()
+    print(f"本机IP: {direct_ip}\n")
+
+    results = []
+    for i, (upstream_proto, local_proto, desc) in enumerate(combinations, 1):
+        upstream_url = f"{upstream_proto}://{PROXY_ADDR}"
+
         try:
-            url = create_proxy(upstream, local_type)
-            print(f"{desc}: {url}")
+            local_url = create_proxy(upstream_url, local_proto)
+            proxy_ip = test_proxy(local_url)
+
+            if proxy_ip:
+                status = "OK" if proxy_ip != direct_ip else "WARN"
+                print(f"[{i}/8] {desc:20} {status:4} {proxy_ip}")
+                results.append((desc, True, proxy_ip))
+            else:
+                print(f"[{i}/8] {desc:20} FAIL")
+                results.append((desc, False, None))
         except Exception as e:
-            print(f"{desc}: 失败 - {e}")
+            print(f"[{i}/8] {desc:20} ERR  {str(e)[:40]}")
+            results.append((desc, False, None))
 
-    # 错误处理
-    print("\n错误处理:")
-    try:
-        create_proxy("invalid://url", "http")
-    except ValueError as e:
-        print(f"配置错误: {e}")
-
-    try:
-        create_proxy("ftp://proxy.com:21", "http")
-    except ValueError as e:
-        print(f"协议错误: {e}")
+    success = sum(1 for _, ok, _ in results if ok)
+    print(f"\n成功率: {success}/{len(combinations)}")
 
 
 if __name__ == "__main__":
