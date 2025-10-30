@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proxy-relay"
-version = "1.0.0"
+version = "1.1.0"
 description = "多协议代理中转器，支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证"
 readme = "README.md"
 requires-python = ">=3.7"

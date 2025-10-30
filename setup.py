@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="proxy-relay",
-    version="1.0.0",
+    version="1.1.0",
     author="huazz233",
     author_email="huazz233@163.com",
     description="多协议代理中转器，支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证",
