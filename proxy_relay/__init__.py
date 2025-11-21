@@ -673,38 +673,81 @@ class Socks5Proxy(BaseProxy):
         return upstream_reader, upstream_writer
 
 
-_background_loop = None
-_background_thread = None
-_loop_lock = threading.Lock()
 _proxy_registry = {}
 _registry_lock = threading.Lock()
 
 
+class BackgroundLoopManager:
+    """Manage a background asyncio event loop for sync-style APIs."""
+
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """Return a running event loop, creating one in a background thread if needed."""
+        with self._lock:
+            if self._loop is None or self._loop.is_closed() or not self._loop.is_running():
+                loop = asyncio.new_event_loop()
+                self._loop = loop
+
+                def run_loop() -> None:
+                    asyncio.set_event_loop(loop)
+                    loop.run_forever()
+
+                self._thread = threading.Thread(target=run_loop, daemon=True)
+                self._thread.start()
+
+            return self._loop
+
+    def run(self, coro, timeout: Optional[float] = None):
+        """Run *coro* on the background loop and wait for the result."""
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise ProxyError(f"Operation timeout ({timeout}s)")
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Stop the background loop and join its thread, if they exist."""
+        with self._lock:
+            loop = self._loop
+            thread = self._thread
+
+        if loop is None:
+            return
+
+        if loop.is_closed():
+            with self._lock:
+                self._loop = None
+                self._thread = None
+            return
+
+        loop.call_soon_threadsafe(loop.stop)
+
+        if thread is not None:
+            thread.join(timeout)
+
+        with self._lock:
+            if not loop.is_closed() and not loop.is_running():
+                loop.close()
+            if loop is self._loop:
+                self._loop = None
+                self._thread = None
+
+
+_loop_manager = BackgroundLoopManager()
+
+
 def _get_background_loop():
-    global _background_loop, _background_thread
-
-    with _loop_lock:
-        if _background_loop is None or not _background_loop.is_running():
-            _background_loop = asyncio.new_event_loop()
-
-            def run_loop():
-                asyncio.set_event_loop(_background_loop)
-                _background_loop.run_forever()
-
-            _background_thread = threading.Thread(target=run_loop, daemon=True)
-            _background_thread.start()
-
-        return _background_loop
+    return _loop_manager.loop
 
 
 def _run_async(coro, timeout=None):
-    loop = _get_background_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    try:
-        return future.result(timeout=timeout)
-    except TimeoutError:
-        future.cancel()
-        raise ProxyError(f"Operation timeout ({timeout}s)")
+    return _loop_manager.run(coro, timeout=timeout)
 
 
 async def create_proxy_async(upstream_url: str, local_type: str = 'http', connect_timeout: float = 30.0,
@@ -760,6 +803,11 @@ def cleanup():
             _run_async(proxy.stop(), timeout=10.0)
         except Exception:
             pass
+
+    try:
+        _loop_manager.shutdown()
+    except Exception:
+        pass
 
 
 atexit.register(cleanup)
