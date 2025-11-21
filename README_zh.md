@@ -2,6 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PyPI - Version](https://img.shields.io/pypi/v/proxy-relay.svg)](https://pypi.org/project/proxy-relay/)
 
 > 本文档为简体中文版本。English version: [README.md](README.md)
 
