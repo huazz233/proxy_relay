@@ -1,92 +1,89 @@
-# Proxy Relay - Proxy Relay/Conversion
+# Proxy Relay - 代理中转器
 
 [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**English** | [简体中文](README_zh.md)
+> 本文档为简体中文版本。English version: [README.md](README.md)
 
-Proxy Relay is a pure-Python proxy relay/conversion tool that can convert
-upstream HTTP/HTTPS/SOCKS5/SOCKS5H proxies into local HTTP or SOCKS5 proxies.
-The local proxy itself does not require authentication.
+代理协议转换工具，支持 HTTP/HTTPS/SOCKS5/SOCKS5H 互转，本地代理无需账密认证。
 
-**Typical use cases**: proxy relay for automation tools such as
-Playwright, Selenium and DrissionPage.
+**主要应用场景**：Playwright / Selenium / DrissionPage 等自动化工具的代理中转。
 
-## Features
+## 特性
 
-- Protocol conversion: supports 8 protocol combinations
-- Sync & async APIs: suitable for scripts and async apps
-- Auto cleanup: resources are released on process exit
-- Thread/process safe: works in multithreaded and multiprocess scenarios
-- Zero runtime dependencies: implemented in pure Python
+- 协议互转：支持 8 种协议组合
+- 同步 / 异步 API：适配不同使用场景
+- 自动清理：进程退出时自动释放资源
+- 线程安全：支持多线程 / 多进程并发
+- 零依赖：纯 Python 实现
 
-## Installation
+## 安装
 
 ```bash
 pip install proxy-relay
 ```
 
-To install the latest version from GitHub:
+如果希望安装最新 GitHub 版本，可以使用：
 
 ```bash
 pip install "git+https://github.com/huazz233/proxy_relay.git"
 ```
 
-## Quick Start
+## 快速开始
 
 ```python
 from proxy_relay import create_proxy
 import requests
 
-# Create a local proxy from an upstream SOCKS5 proxy
+# 创建本地代理（从上游 SOCKS5 代理转换为本地 HTTP 代理）
 url = create_proxy("socks5://user:pass@proxy.com:1080")
 
-# Use the local proxy to access a test URL
+# 使用本地代理访问测试地址
 resp = requests.get("https://api.ipify.org/", proxies={"http": url, "https": url})
 print(resp.text)
 ```
 
-## Use Cases
+## 使用场景
 
-### Scripts / Tests
+### 脚本 / 测试
 
 ```python
 from proxy_relay import create_proxy
 
 url = create_proxy("http://proxy.com:8080")
-# Use the proxy...
-# Resources will be cleaned up automatically when the process exits
+# 使用代理...
+# 进程退出时自动清理
 ```
 
-### Long-running Services
+### 长期运行服务
 
 ```python
 from proxy_relay import create_proxy, cleanup
 
 url = create_proxy("http://proxy.com:8080")
-# Use the proxy...
-cleanup()  # Manually cleanup in long-running services
+# 使用代理...
+cleanup()  # 手动清理
 ```
 
-### Async Applications
+### 异步应用
 
 ```python
 import asyncio
 from proxy_relay import create_proxy_async, HttpProxy
 
 async def main():
-    # Simple: directly create a local proxy URL
+    # 简单方式：直接创建本地代理 URL
     url = await create_proxy_async("http://proxy.com:8080")
 
-    # Context manager: automatically start and stop the proxy
+    # 上下文管理器方式：自动启动和关闭代理
     async with HttpProxy("http://proxy.com:8080") as proxy:
         url = proxy.get_local_url()
-        # Use the proxy...
+        # 使用代理...
 
 asyncio.run(main())
 ```
 
-### Playwright Integration (Python)
+### Playwright 集成（Python）
 
 ```python
 import asyncio
@@ -97,7 +94,7 @@ UPSTREAM_PROXY = "socks5://user:pass@proxy.com:1080"
 TEST_URL = "https://api.ipify.org/"
 
 async def main():
-    # Convert upstream proxy to a local HTTP proxy
+    # 通过 proxy_relay 将上游代理转换成本地 HTTP 代理
     local_url = await create_proxy_async(UPSTREAM_PROXY, local_type="http")
 
     async with async_playwright() as p:
@@ -111,7 +108,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### Selenium Integration (Python)
+### Selenium 集成（Python）
 
 ```python
 from proxy_relay import create_proxy
@@ -122,7 +119,7 @@ UPSTREAM_PROXY = "socks5://user:pass@proxy.com:1080"
 TEST_URL = "https://api.ipify.org/"
 
 def main():
-    # Create a local HTTP proxy
+    # 创建本地 HTTP 代理
     local_url = create_proxy(UPSTREAM_PROXY, local_type="http")
 
     options = Options()
@@ -139,7 +136,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### DrissionPage Integration (Python)
+### DrissionPage 集成（Python）
 
 ```python
 from proxy_relay import create_proxy
@@ -149,11 +146,11 @@ UPSTREAM_PROXY = "socks5://user:pass@proxy.com:1080"
 TEST_URL = "https://api.ipify.org/"
 
 def main():
-    # Create a local HTTP proxy
+    # 创建本地 HTTP 代理
     local_url = create_proxy(UPSTREAM_PROXY, local_type="http")
 
     options = ChromiumOptions()
-    # DrissionPage accepts a full proxy URL, e.g. http://127.0.0.1:12345
+    # 直接使用本地代理 URL
     options.set_proxy(local_url)
 
     page = ChromiumPage(options)
@@ -165,31 +162,31 @@ if __name__ == "__main__":
     main()
 ```
 
-> For more detailed integration examples, see `docs/integration-examples.md`.
+> 更多集成示例与运行说明，可参考：`docs/integration-examples.md`。
 
-## API Reference
+## API 参考
 
-### Sync APIs
+### 同步 API
 
 ```python
-# Create a proxy
+# 创建代理
 create_proxy(upstream_url, local_type="http", connect_timeout=30.0, idle_timeout=300.0, timeout=30.0)
-create_http_proxy(upstream_url, ...)      # Shortcut for HTTP proxies
-create_socks5_proxy(upstream_url, ...)    # Shortcut for SOCKS5 proxies
+create_http_proxy(upstream_url, ...)      # HTTP 代理快捷方法
+create_socks5_proxy(upstream_url, ...)    # SOCKS5 代理快捷方法
 
-# Cleanup (optional, resources are also cleaned on process exit)
+# 清理代理（可选，进程退出时自动清理）
 cleanup()
 ```
 
-### Async APIs
+### 异步 API
 
 ```python
-# Create a proxy
+# 创建代理
 await create_proxy_async(upstream_url, local_type="http", ...)
 await create_http_proxy_async(upstream_url, ...)
 await create_socks5_proxy_async(upstream_url, ...)
 
-# Context managers
+# 上下文管理器
 async with HttpProxy(upstream_url) as proxy:
     url = proxy.get_local_url()
 
@@ -197,55 +194,55 @@ async with Socks5Proxy(upstream_url) as proxy:
     url = proxy.get_local_url()
 ```
 
-### Advanced APIs
+### 高级 API
 
 ```python
-# ProxyManager - manage multiple proxies
+# ProxyManager - 管理多个代理
 import asyncio
 from proxy_relay import ProxyManager
 
 async def main():
     async with ProxyManager() as manager:
         url = await manager.create(upstream_url, local_type="http")
-        await manager.stop(url)      # Stop a single proxy
-        await manager.stop_all()     # Stop all proxies
+        await manager.stop(url)      # 停止单个
+        await manager.stop_all()     # 停止所有
 
 asyncio.run(main())
 ```
 
-## Supported Protocols
+## 支持的协议
 
-| Upstream   | Local       | Example                             |
-|------------|------------|-------------------------------------|
-| HTTP/HTTPS | HTTP/SOCKS5| `http://proxy.com:8080`             |
-| SOCKS5     | HTTP/SOCKS5| `socks5://user:pass@proxy.com:1080` |
-| SOCKS5H    | HTTP/SOCKS5| `socks5h://proxy.com:1080`          |
+| 上游协议   | 本地协议     | 示例                             |
+|------------|--------------|----------------------------------|
+| HTTP/HTTPS | HTTP/SOCKS5  | `http://proxy.com:8080`          |
+| SOCKS5     | HTTP/SOCKS5  | `socks5://user:pass@proxy.com:1080` |
+| SOCKS5H    | HTTP/SOCKS5  | `socks5h://proxy.com:1080`       |
 
-## Parameters
+## 参数说明
 
-- `upstream_url`: upstream proxy URL
-- `local_type`: local proxy type (`"http"` or `"socks5"`)
-- `connect_timeout`: connection timeout in seconds (default 30)
-- `idle_timeout`: idle timeout in seconds (default 300)
-- `timeout`: creation timeout in seconds (default 30)
+- `upstream_url`：上游代理 URL
+- `local_type`：本地代理类型（`"http"` 或 `"socks5"`）
+- `connect_timeout`：连接超时（秒），默认 30
+- `idle_timeout`：空闲超时（秒），默认 300
+- `timeout`：创建超时（秒），默认 30
 
-## Multi-process / Multi-thread
+## 多进程 / 多线程
 
-- Fully thread-safe
-- Safe for multi-process use (Windows / macOS default `spawn` mode)
-- On Linux `fork` mode, it is recommended **not** to create proxies before forking
+- 完全线程安全
+- 多进程安全（Windows / macOS 默认 spawn 模式）
+- Linux fork 模式：建议在 fork 前不要创建代理
 
-## FAQ
+## 常见问题
 
-**Q: Will the proxy keep running?**  
-A: Yes, until the process exits or `cleanup()` is called.
+**Q: 代理会一直运行吗？**  
+A: 会，直到进程结束或手动调用 `cleanup()`。
 
-**Q: How to avoid resource leaks in long-running services?**  
-A: Call `cleanup()` periodically or use `ProxyManager` to manage proxies.
+**Q: 长期运行的服务如何避免资源累积？**  
+A: 定期调用 `cleanup()` 或使用 `ProxyManager`。
 
-**Q: What's the difference between sync and async APIs?**  
-A: Sync APIs are convenient for simple scripts; async APIs are more suitable for async applications (e.g. FastAPI).
+**Q: 同步 API 和异步 API 有什么区别？**  
+A: 同步 API 适合脚本，异步 API 适合异步应用（如 FastAPI）。
 
-## License
+## 许可证
 
 MIT License

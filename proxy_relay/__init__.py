@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多协议代理中转器 - 支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证"""
+"""Multi-protocol proxy relay - supports HTTP/HTTPS/SOCKS5/SOCKS5H conversion, local proxy without auth."""
 
 import asyncio
 import atexit
@@ -14,9 +14,9 @@ from urllib.parse import urlparse
 __version__ = "1.1.0"
 __author__ = "huazz233"
 
-# 协议限制常量
-MAX_LINE_SIZE = 8192  # HTTP请求行最大长度
-MAX_DOMAIN_LEN = 255  # 域名最大长度(RFC1928)
+# Protocol limits
+MAX_LINE_SIZE = 8192  # Max HTTP line length
+MAX_DOMAIN_LEN = 255  # Max domain length (RFC1928)
 
 
 def extract_sni_from_client_hello(data: bytes) -> Optional[str]:
@@ -113,9 +113,9 @@ async def _read_exact(reader: asyncio.StreamReader, n: int, timeout: Optional[fl
             return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
         return await reader.readexactly(n)
     except asyncio.TimeoutError:
-        raise ClientConnectionError(f"读取{n}字节超时")
+        raise ClientConnectionError(f"Read timeout for {n} bytes")
     except asyncio.IncompleteReadError:
-        raise ClientConnectionError(f"连接意外关闭,期望{n}字节")
+        raise ClientConnectionError(f"Connection closed unexpectedly, expected {n} bytes")
 
 
 async def connect_upstream(host: str, port: int, timeout: Optional[float] = None):
@@ -124,9 +124,9 @@ async def connect_upstream(host: str, port: int, timeout: Optional[float] = None
             return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
         return await asyncio.open_connection(host, port)
     except asyncio.TimeoutError:
-        raise UpstreamConnectionError(f"连接超时 {host}:{port}")
+        raise UpstreamConnectionError(f"Connection timeout {host}:{port}")
     except Exception as e:
-        raise UpstreamConnectionError(f"连接失败 {host}:{port} - {e}")
+        raise UpstreamConnectionError(f"Connection failed {host}:{port} - {e}")
 
 
 async def send_http_connect(upstream_reader, upstream_writer, target_host: str, target_port: int,
@@ -145,28 +145,28 @@ async def send_http_connect(upstream_reader, upstream_writer, target_host: str, 
     async def read_response():
         response_line = await upstream_reader.readline()
         if not response_line:
-            raise UpstreamConnectionError("上游无响应")
+            raise UpstreamConnectionError("No response from upstream")
         if len(response_line) > MAX_LINE_SIZE:
-            raise UpstreamConnectionError(f"HTTP响应行过长: {len(response_line)} > {MAX_LINE_SIZE}")
+            raise UpstreamConnectionError(f"HTTP response line too long: {len(response_line)} > {MAX_LINE_SIZE}")
 
         response = response_line.decode('utf-8', errors='ignore').strip()
 
         while True:
             line = await upstream_reader.readline()
             if len(line) > MAX_LINE_SIZE:
-                raise UpstreamConnectionError(f"HTTP响应行过长: {len(line)} > {MAX_LINE_SIZE}")
+                raise UpstreamConnectionError(f"HTTP response line too long: {len(line)} > {MAX_LINE_SIZE}")
             if not line or line == b'\r\n':
                 break
 
         if "200" not in response:
-            raise UpstreamConnectionError(f"CONNECT失败: {response}")
+            raise UpstreamConnectionError(f"CONNECT failed: {response}")
 
         return True
 
     try:
         return await asyncio.wait_for(read_response(), timeout=timeout)
     except asyncio.TimeoutError:
-        raise UpstreamConnectionError(f"HTTP CONNECT超时({timeout}s)")
+        raise UpstreamConnectionError(f"HTTP CONNECT timeout ({timeout}s)")
 
 
 class BaseProxy(ABC):
@@ -368,14 +368,14 @@ class HttpProxy(BaseProxy):
                 while True:
                     line = await reader.readline()
                     if len(line) > MAX_LINE_SIZE:
-                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+                        raise ClientConnectionError(f"HTTP request line too long: {len(line)} > {MAX_LINE_SIZE}")
                     if not line or line == b'\r\n':
                         break
 
             try:
                 await asyncio.wait_for(skip_headers(), timeout=self.connect_timeout)
             except asyncio.TimeoutError:
-                raise ClientConnectionError("读取客户端请求头超时")
+                raise ClientConnectionError("Read client request headers timeout")
 
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
 
@@ -400,7 +400,7 @@ class HttpProxy(BaseProxy):
                 while True:
                     line = await reader.readline()
                     if len(line) > MAX_LINE_SIZE:
-                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+                        raise ClientConnectionError(f"HTTP request line too long: {len(line)} > {MAX_LINE_SIZE}")
 
                     if line == b'\r\n':
                         if not auth_added and self.upstream_config.get('username') and self.upstream_config.get(
@@ -419,7 +419,7 @@ class HttpProxy(BaseProxy):
             try:
                 await asyncio.wait_for(forward_headers(), timeout=self.connect_timeout)
             except asyncio.TimeoutError:
-                raise ClientConnectionError("读取客户端请求头超时")
+                raise ClientConnectionError("Read client request headers timeout")
 
             await upstream_writer.drain()
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
@@ -433,7 +433,7 @@ class HttpProxy(BaseProxy):
 
 
 class Socks5Proxy(BaseProxy):
-    """SOCKS5代理,支持双协议"""
+    """SOCKS5 proxy supporting both HTTP and SOCKS5 clients."""
 
     def get_local_url(self) -> str:
         return f"socks5://{self.local_host}:{self.local_port}"
@@ -526,7 +526,7 @@ class Socks5Proxy(BaseProxy):
         try:
             request_line_bytes = initial_data + await reader.readline()
             if len(request_line_bytes) > MAX_LINE_SIZE:
-                raise ClientConnectionError(f"HTTP请求行过长: {len(request_line_bytes)} > {MAX_LINE_SIZE}")
+                raise ClientConnectionError(f"HTTP request line too long: {len(request_line_bytes)} > {MAX_LINE_SIZE}")
 
             request_line = request_line_bytes.decode('utf-8', errors='ignore').strip()
             parts = request_line.split()
@@ -543,14 +543,14 @@ class Socks5Proxy(BaseProxy):
                 while True:
                     line = await reader.readline()
                     if len(line) > MAX_LINE_SIZE:
-                        raise ClientConnectionError(f"HTTP请求行过长: {len(line)} > {MAX_LINE_SIZE}")
+                        raise ClientConnectionError(f"HTTP request line too long: {len(line)} > {MAX_LINE_SIZE}")
                     if not line or line == b'\r\n':
                         break
 
             try:
                 await asyncio.wait_for(skip_request_headers(), timeout=self.connect_timeout)
             except asyncio.TimeoutError:
-                raise ClientConnectionError("读取客户端请求头超时")
+                raise ClientConnectionError("Read client request headers timeout")
 
             upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
 
@@ -617,23 +617,23 @@ class Socks5Proxy(BaseProxy):
 
         ver, chosen_method = await _read_exact(upstream_reader, 2, self.connect_timeout)
         if ver != 0x05 or chosen_method == 0xFF:
-            raise UpstreamConnectionError("SOCKS5握手失败")
+            raise UpstreamConnectionError("SOCKS5 handshake failed")
 
         if chosen_method == 0x02:
             username = self.upstream_config['username'].encode('utf-8')
             password = self.upstream_config['password'].encode('utf-8')
 
             if len(username) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"用户名长度超限: {len(username)} > {MAX_DOMAIN_LEN}")
+                raise ProxyError(f"Username too long: {len(username)} > {MAX_DOMAIN_LEN}")
             if len(password) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"密码长度超限: {len(password)} > {MAX_DOMAIN_LEN}")
+                raise ProxyError(f"Password too long: {len(password)} > {MAX_DOMAIN_LEN}")
 
             upstream_writer.write(b'\x01' + bytes([len(username)]) + username + bytes([len(password)]) + password)
             await upstream_writer.drain()
 
             ver, status = await _read_exact(upstream_reader, 2, self.connect_timeout)
             if ver != 0x01 or status != 0x00:
-                raise UpstreamConnectionError("SOCKS5认证失败")
+                raise UpstreamConnectionError("SOCKS5 authentication failed")
 
         req = bytearray(b'\x05\x01\x00')
 
@@ -657,7 +657,7 @@ class Socks5Proxy(BaseProxy):
             req.extend(socket.inet_pton(socket.AF_INET6, target_host))
         else:
             if len(target_host) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"目标域名长度超限: {len(target_host)} > {MAX_DOMAIN_LEN}")
+                raise ProxyError(f"Target domain too long: {len(target_host)} > {MAX_DOMAIN_LEN}")
             req.append(0x03)
             req.append(len(target_host))
             req.extend(target_host.encode('ascii'))
@@ -668,7 +668,7 @@ class Socks5Proxy(BaseProxy):
 
         response = await _read_exact(upstream_reader, 10, self.connect_timeout)
         if response[1] != 0x00:
-            raise UpstreamConnectionError(f"SOCKS5连接失败: {response[1]}")
+            raise UpstreamConnectionError(f"SOCKS5 connect failed: {response[1]}")
 
         return upstream_reader, upstream_writer
 
@@ -704,7 +704,7 @@ def _run_async(coro, timeout=None):
         return future.result(timeout=timeout)
     except TimeoutError:
         future.cancel()
-        raise ProxyError(f"操作超时({timeout}s)")
+        raise ProxyError(f"Operation timeout ({timeout}s)")
 
 
 async def create_proxy_async(upstream_url: str, local_type: str = 'http', connect_timeout: float = 30.0,
@@ -745,10 +745,11 @@ def create_socks5_proxy(upstream_url: str, connect_timeout: float = 30.0, idle_t
 
 
 def cleanup():
-    """清理所有代理资源。
+    """Cleanup all proxy resources.
 
-    通常不需要手动调用,进程结束时会自动清理。
-    仅在长期运行的服务中需要手动清理时使用。
+    Usually you don't need to call this manually; resources are
+    cleaned up automatically when the process exits. For long-running
+    services you can call this explicitly to reclaim resources.
     """
     with _registry_lock:
         proxies = list(_proxy_registry.values())

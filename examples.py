@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import os
+
 import requests
 
 from proxy_relay import create_proxy
 
-PROXY_ADDR = "user:pass@proxy.example.com:1080"
+PROXY_ADDR = os.getenv("UPSTREAM_PROXY", "user:pass@proxy.example.com:1080")
 # TEST_URL = "http://208.95.112.1/json/"
 TEST_URL = "https://api.ipify.org/"
 TIMEOUT = 30
@@ -13,7 +14,7 @@ TIMEOUT = 30
 def get_direct_ip():
     try:
         return requests.get(TEST_URL, timeout=TIMEOUT).text.strip()
-    except:
+    except Exception:
         return None
 
 
@@ -21,7 +22,7 @@ def test_proxy(local_url):
     try:
         proxies = {'http': local_url, 'https': local_url}
         return requests.get(TEST_URL, proxies=proxies, timeout=TIMEOUT).text.strip()
-    except:
+    except Exception:
         return None
 
 
@@ -38,7 +39,7 @@ def main():
     ]
 
     direct_ip = get_direct_ip()
-    print(f"本机IP: {direct_ip}\n")
+    print(f"Direct IP: {direct_ip}\n")
 
     results = []
     for i, (upstream_proto, local_proto, desc) in enumerate(combinations, 1):
@@ -60,7 +61,7 @@ def main():
             results.append((desc, False, None))
 
     success = sum(1 for _, ok, _ in results if ok)
-    print(f"\n成功率: {success}/{len(combinations)}")
+    print(f"\nSuccess rate: {success}/{len(combinations)}")
 
 
 if __name__ == "__main__":
