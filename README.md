@@ -12,6 +12,7 @@ The local proxy itself does not require authentication.
 
 **Typical use cases**: proxy relay for automation tools such as
 Playwright, Selenium and DrissionPage.
+<img width="563" height="315" alt="image" src="https://github.com/user-attachments/assets/b3aa1a3d-8173-4ab0-bb25-ae31e87de549" />
 
 ## Features
 
