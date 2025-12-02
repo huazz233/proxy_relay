@@ -9,6 +9,7 @@
 代理协议转换工具，支持 HTTP/HTTPS/SOCKS5/SOCKS5H 互转，本地代理无需账密认证。
 
 **主要应用场景**：Playwright / Selenium / DrissionPage 等自动化工具的代理中转。
+<img width="563" height="315" alt="image" src="https://github.com/user-attachments/assets/cef89b23-726b-4395-af8a-2dcdd80ee4a7" />
 
 ## 特性
 
