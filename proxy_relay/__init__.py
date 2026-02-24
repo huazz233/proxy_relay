@@ -95,6 +95,23 @@ def is_socks_scheme(scheme: str) -> bool:
     return scheme in ['socks5', 'socks5h']
 
 
+def _parse_host_port(target: str) -> Tuple[str, int]:
+    if target.startswith('['):
+        bracket_end = target.find(']')
+        if bracket_end == -1:
+            raise ValueError(f"Invalid IPv6 address format: {target}")
+        host = target[1:bracket_end]
+        rest = target[bracket_end + 1:]
+        if rest.startswith(':'):
+            port = int(rest[1:])
+        else:
+            raise ValueError(f"Missing port in target: {target}")
+    else:
+        host, port_str = target.rsplit(':', 1)
+        port = int(port_str)
+    return host, port
+
+
 class ProxyError(Exception):
     pass
 
@@ -109,7 +126,7 @@ class ClientConnectionError(ProxyError):
 
 async def _read_exact(reader: asyncio.StreamReader, n: int, timeout: Optional[float] = None):
     try:
-        if timeout:
+        if timeout is not None:
             return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
         return await reader.readexactly(n)
     except asyncio.TimeoutError:
@@ -120,7 +137,7 @@ async def _read_exact(reader: asyncio.StreamReader, n: int, timeout: Optional[fl
 
 async def connect_upstream(host: str, port: int, timeout: Optional[float] = None):
     try:
-        if timeout:
+        if timeout is not None:
             return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
         return await asyncio.open_connection(host, port)
     except asyncio.TimeoutError:
@@ -158,7 +175,8 @@ async def send_http_connect(upstream_reader, upstream_writer, target_host: str, 
             if not line or line == b'\r\n':
                 break
 
-        if "200" not in response:
+        resp_parts = response.split(None, 2)
+        if len(resp_parts) < 2 or resp_parts[1] != '200':
             raise UpstreamConnectionError(f"CONNECT failed: {response}")
 
         return True
@@ -167,6 +185,85 @@ async def send_http_connect(upstream_reader, upstream_writer, target_host: str, 
         return await asyncio.wait_for(read_response(), timeout=timeout)
     except asyncio.TimeoutError:
         raise UpstreamConnectionError(f"HTTP CONNECT timeout ({timeout}s)")
+
+
+async def send_socks5_connect(upstream_reader, upstream_writer, target_host: str, target_port: int,
+                               auth_config: dict = None, timeout: float = 10.0) -> bool:
+    """Perform SOCKS5 handshake + CONNECT on an established TCP connection."""
+    auth_methods = [0x00]
+    if auth_config and auth_config.get('username') and auth_config.get('password'):
+        auth_methods.append(0x02)
+
+    upstream_writer.write(b'\x05' + bytes([len(auth_methods)]) + bytes(auth_methods))
+    await upstream_writer.drain()
+
+    ver, chosen_method = await _read_exact(upstream_reader, 2, timeout)
+    if ver != 0x05 or chosen_method == 0xFF:
+        raise UpstreamConnectionError("SOCKS5 handshake failed")
+
+    if chosen_method == 0x02:
+        if not auth_config or not auth_config.get('username') or not auth_config.get('password'):
+            raise UpstreamConnectionError("SOCKS5 server requires auth but no credentials provided")
+        username = auth_config['username'].encode('utf-8')
+        password = auth_config['password'].encode('utf-8')
+        if len(username) > MAX_DOMAIN_LEN:
+            raise ProxyError(f"Username too long: {len(username)} > {MAX_DOMAIN_LEN}")
+        if len(password) > MAX_DOMAIN_LEN:
+            raise ProxyError(f"Password too long: {len(password)} > {MAX_DOMAIN_LEN}")
+        upstream_writer.write(b'\x01' + bytes([len(username)]) + username + bytes([len(password)]) + password)
+        await upstream_writer.drain()
+        ver, status = await _read_exact(upstream_reader, 2, timeout)
+        if ver != 0x01 or status != 0x00:
+            raise UpstreamConnectionError("SOCKS5 authentication failed")
+    elif chosen_method != 0x00:
+        raise UpstreamConnectionError(f"SOCKS5 unsupported auth method: {chosen_method}")
+
+    req = bytearray(b'\x05\x01\x00')
+    is_ipv4 = False
+    is_ipv6 = False
+    try:
+        socket.inet_pton(socket.AF_INET, target_host)
+        is_ipv4 = True
+    except (socket.error, OSError, AttributeError):
+        try:
+            socket.inet_pton(socket.AF_INET6, target_host)
+            is_ipv6 = True
+        except (socket.error, OSError, AttributeError):
+            pass
+
+    if is_ipv4:
+        req.append(0x01)
+        req.extend(socket.inet_pton(socket.AF_INET, target_host))
+    elif is_ipv6:
+        req.append(0x04)
+        req.extend(socket.inet_pton(socket.AF_INET6, target_host))
+    else:
+        if len(target_host) > MAX_DOMAIN_LEN:
+            raise ProxyError(f"Target domain too long: {len(target_host)} > {MAX_DOMAIN_LEN}")
+        req.append(0x03)
+        req.append(len(target_host))
+        req.extend(target_host.encode('ascii'))
+
+    req.extend(target_port.to_bytes(2, 'big'))
+    upstream_writer.write(req)
+    await upstream_writer.drain()
+
+    header = await _read_exact(upstream_reader, 4, timeout)
+    if header[1] != 0x00:
+        raise UpstreamConnectionError(f"SOCKS5 connect failed: {header[1]}")
+
+    atyp = header[3]
+    if atyp == 0x01:
+        await _read_exact(upstream_reader, 4 + 2, timeout)
+    elif atyp == 0x04:
+        await _read_exact(upstream_reader, 16 + 2, timeout)
+    elif atyp == 0x03:
+        domain_len = (await _read_exact(upstream_reader, 1, timeout))[0]
+        await _read_exact(upstream_reader, domain_len + 2, timeout)
+    else:
+        raise UpstreamConnectionError(f"SOCKS5 unknown address type: {atyp}")
+
+    return True
 
 
 class BaseProxy(ABC):
@@ -232,7 +329,13 @@ class BaseProxy(ABC):
             finally:
                 try:
                     if not dst.is_closing():
-                        dst.close()
+                        try:
+                            if dst.can_write_eof():
+                                dst.write_eof()
+                        except (OSError, RuntimeError):
+                            pass
+                        if not dst.is_closing():
+                            dst.close()
                 except Exception:
                     pass
 
@@ -311,6 +414,22 @@ class HttpProxy(BaseProxy):
     def get_local_url(self) -> str:
         return f"http://{self.local_host}:{self.local_port}"
 
+    async def _connect_upstream(self, target_host: str, target_port: int):
+        upstream_reader, upstream_writer = await connect_upstream(
+            self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
+        )
+        if is_socks_scheme(self.upstream_config['scheme']):
+            await send_socks5_connect(
+                upstream_reader, upstream_writer, target_host, target_port,
+                self.upstream_config, self.connect_timeout
+            )
+        else:
+            await send_http_connect(
+                upstream_reader, upstream_writer, target_host, target_port,
+                self.upstream_config, self.connect_timeout
+            )
+        return upstream_reader, upstream_writer
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await reader.readline()
@@ -347,19 +466,12 @@ class HttpProxy(BaseProxy):
                 pass
 
     async def _handle_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: str):
+        upstream_writer = None
         try:
             target = request.split()[1]
-            target_host, target_port_str = target.split(':', 1)
-            target_port = int(target_port_str)
+            target_host, target_port = _parse_host_port(target)
 
-            upstream_reader, upstream_writer = await connect_upstream(
-                self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
-            )
-
-            await send_http_connect(
-                upstream_reader, upstream_writer, target_host, target_port,
-                self.upstream_config, self.connect_timeout
-            )
+            upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
 
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
@@ -385,9 +497,80 @@ class HttpProxy(BaseProxy):
                 await writer.drain()
             except Exception:
                 pass
+        finally:
+            if upstream_writer is not None:
+                try:
+                    if not upstream_writer.is_closing():
+                        upstream_writer.close()
+                        await upstream_writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _handle_http_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                    request_line: bytes):
+        try:
+            if is_socks_scheme(self.upstream_config['scheme']):
+                await self._handle_http_via_socks5(reader, writer, request_line)
+            else:
+                await self._handle_http_via_http(reader, writer, request_line)
+        except Exception:
+            try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+            except Exception:
+                pass
+
+    async def _handle_http_via_socks5(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                                      request_line: bytes):
+        upstream_writer = None
+        try:
+            request = request_line.decode('utf-8', errors='ignore').strip()
+            parts = request.split()
+            method, url, version = parts[0], parts[1], parts[2]
+
+            parsed = urlparse(url)
+            target_host = parsed.hostname
+            target_port = parsed.port or 80
+            path = parsed.path or '/'
+            if parsed.params:
+                path += ';' + parsed.params
+            if parsed.query:
+                path += '?' + parsed.query
+
+            upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
+
+            upstream_writer.write(f"{method} {path} {version}\r\n".encode())
+
+            async def forward_headers():
+                while True:
+                    line = await reader.readline()
+                    if len(line) > MAX_LINE_SIZE:
+                        raise ClientConnectionError(f"HTTP request line too long: {len(line)} > {MAX_LINE_SIZE}")
+                    if not line or line == b'\r\n':
+                        upstream_writer.write(b'\r\n')
+                        break
+                    if not line.lower().startswith(b'proxy-'):
+                        upstream_writer.write(line)
+
+            try:
+                await asyncio.wait_for(forward_headers(), timeout=self.connect_timeout)
+            except asyncio.TimeoutError:
+                raise ClientConnectionError("Read client request headers timeout")
+
+            await upstream_writer.drain()
+            await self._relay_data(reader, writer, upstream_reader, upstream_writer)
+        finally:
+            if upstream_writer is not None:
+                try:
+                    if not upstream_writer.is_closing():
+                        upstream_writer.close()
+                        await upstream_writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def _handle_http_via_http(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                                    request_line: bytes):
+        upstream_writer = None
         try:
             upstream_reader, upstream_writer = await connect_upstream(
                 self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
@@ -402,7 +585,7 @@ class HttpProxy(BaseProxy):
                     if len(line) > MAX_LINE_SIZE:
                         raise ClientConnectionError(f"HTTP request line too long: {len(line)} > {MAX_LINE_SIZE}")
 
-                    if line == b'\r\n':
+                    if not line or line == b'\r\n':
                         if not auth_added and self.upstream_config.get('username') and self.upstream_config.get(
                                 'password'):
                             auth_str = f"{self.upstream_config['username']}:{self.upstream_config['password']}"
@@ -413,6 +596,7 @@ class HttpProxy(BaseProxy):
 
                     if line.lower().startswith(b'proxy-authorization:'):
                         auth_added = True
+                        continue
 
                     upstream_writer.write(line)
 
@@ -423,13 +607,14 @@ class HttpProxy(BaseProxy):
 
             await upstream_writer.drain()
             await self._relay_data(reader, writer, upstream_reader, upstream_writer)
-
-        except Exception:
-            try:
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await writer.drain()
-            except Exception:
-                pass
+        finally:
+            if upstream_writer is not None:
+                try:
+                    if not upstream_writer.is_closing():
+                        upstream_writer.close()
+                        await upstream_writer.wait_closed()
+                except Exception:
+                    pass
 
 
 class Socks5Proxy(BaseProxy):
@@ -482,9 +667,11 @@ class Socks5Proxy(BaseProxy):
                 return
 
             first_packet = None
+            reply_sent = False
             if addr_type in (0x01, 0x04):
                 writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
                 await writer.drain()
+                reply_sent = True
 
                 try:
                     first_packet = await asyncio.wait_for(reader.read(8192), timeout=self.connect_timeout)
@@ -498,12 +685,12 @@ class Socks5Proxy(BaseProxy):
             try:
                 upstream_reader, upstream_writer = await self._connect_upstream(target_host, target_port)
             except Exception:
-                if not first_packet:
+                if not reply_sent:
                     writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
                     await writer.drain()
                 return
 
-            if not first_packet:
+            if not reply_sent:
                 writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
                 await writer.drain()
             else:
@@ -536,8 +723,7 @@ class Socks5Proxy(BaseProxy):
                 await writer.drain()
                 return
 
-            target_host, target_port_str = parts[1].split(':', 1)
-            target_port = int(target_port_str)
+            target_host, target_port = _parse_host_port(parts[1])
 
             async def skip_request_headers():
                 while True:
@@ -566,7 +752,7 @@ class Socks5Proxy(BaseProxy):
             except Exception:
                 pass
 
-    async def _parse_address(self, reader, atyp: int) -> Tuple[str, int]:
+    async def _parse_address(self, reader, atyp: int) -> Tuple[Optional[str], Optional[int], Optional[int]]:
         try:
             if atyp == 0x01:  # IPv4
                 addr_bytes = await _read_exact(reader, 4, self.connect_timeout)
@@ -580,7 +766,7 @@ class Socks5Proxy(BaseProxy):
                 addr_bytes = await _read_exact(reader, 16, self.connect_timeout)
                 target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
             else:
-                return None, None
+                return None, None, None
 
             target_port = struct.unpack('>H', await _read_exact(reader, 2, self.connect_timeout))[0]
             return target_host, target_port, atyp
@@ -589,10 +775,7 @@ class Socks5Proxy(BaseProxy):
 
     async def _connect_upstream(self, target_host: str, target_port: int):
         if is_socks_scheme(self.upstream_config['scheme']):
-            try:
-                return await self._connect_socks5(target_host, target_port)
-            except Exception:
-                return await self._connect_http(target_host, target_port)
+            return await self._connect_socks5(target_host, target_port)
         return await self._connect_http(target_host, target_port)
 
     async def _connect_http(self, target_host: str, target_port: int):
@@ -607,69 +790,10 @@ class Socks5Proxy(BaseProxy):
         upstream_reader, upstream_writer = await connect_upstream(
             self.upstream_config['host'], self.upstream_config['port'], self.connect_timeout
         )
-
-        auth_methods = [0x00]
-        if self.upstream_config.get('username') and self.upstream_config.get('password'):
-            auth_methods.append(0x02)
-
-        upstream_writer.write(b'\x05' + bytes([len(auth_methods)]) + bytes(auth_methods))
-        await upstream_writer.drain()
-
-        ver, chosen_method = await _read_exact(upstream_reader, 2, self.connect_timeout)
-        if ver != 0x05 or chosen_method == 0xFF:
-            raise UpstreamConnectionError("SOCKS5 handshake failed")
-
-        if chosen_method == 0x02:
-            username = self.upstream_config['username'].encode('utf-8')
-            password = self.upstream_config['password'].encode('utf-8')
-
-            if len(username) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"Username too long: {len(username)} > {MAX_DOMAIN_LEN}")
-            if len(password) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"Password too long: {len(password)} > {MAX_DOMAIN_LEN}")
-
-            upstream_writer.write(b'\x01' + bytes([len(username)]) + username + bytes([len(password)]) + password)
-            await upstream_writer.drain()
-
-            ver, status = await _read_exact(upstream_reader, 2, self.connect_timeout)
-            if ver != 0x01 or status != 0x00:
-                raise UpstreamConnectionError("SOCKS5 authentication failed")
-
-        req = bytearray(b'\x05\x01\x00')
-
-        is_ipv4 = False
-        is_ipv6 = False
-        try:
-            socket.inet_pton(socket.AF_INET, target_host)
-            is_ipv4 = True
-        except (socket.error, OSError, AttributeError):
-            try:
-                socket.inet_pton(socket.AF_INET6, target_host)
-                is_ipv6 = True
-            except (socket.error, OSError, AttributeError):
-                pass
-
-        if is_ipv4:
-            req.append(0x01)
-            req.extend(socket.inet_pton(socket.AF_INET, target_host))
-        elif is_ipv6:
-            req.append(0x04)
-            req.extend(socket.inet_pton(socket.AF_INET6, target_host))
-        else:
-            if len(target_host) > MAX_DOMAIN_LEN:
-                raise ProxyError(f"Target domain too long: {len(target_host)} > {MAX_DOMAIN_LEN}")
-            req.append(0x03)
-            req.append(len(target_host))
-            req.extend(target_host.encode('ascii'))
-
-        req.extend(target_port.to_bytes(2, 'big'))
-        upstream_writer.write(req)
-        await upstream_writer.drain()
-
-        response = await _read_exact(upstream_reader, 10, self.connect_timeout)
-        if response[1] != 0x00:
-            raise UpstreamConnectionError(f"SOCKS5 connect failed: {response[1]}")
-
+        await send_socks5_connect(
+            upstream_reader, upstream_writer, target_host, target_port,
+            self.upstream_config, self.connect_timeout
+        )
         return upstream_reader, upstream_writer
 
 
