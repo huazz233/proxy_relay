@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "huazz233"
 
 # Protocol limits
