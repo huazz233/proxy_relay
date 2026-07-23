@@ -30,7 +30,7 @@ from ._transport import STREAM_LIMIT, UpstreamTunnel, configure_socket
 from ._tunnel import TunnelRuntime
 from ._upstream import HttpUpstreamConnector, create_upstream_connector
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __author__ = "huazz233"
 
 logger = logging.getLogger(__name__)

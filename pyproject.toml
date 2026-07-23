@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proxy-relay"
-version = "1.3.0"
+version = "1.4.0"
 description = "Turn authenticated upstream HTTP/HTTPS/SOCKS5 proxies into local unauthenticated HTTP or SOCKS5 proxies."
 readme = "README.md"
 requires-python = ">=3.8"
