@@ -1,4 +1,3 @@
 # Build and publishing tools
-build
-twine
-
+build>=1,<2
+twine>=4,<7

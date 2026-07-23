@@ -4,8 +4,11 @@ from proxy_relay import create_proxy
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY", "socks5://user:pass@proxy.com:1080")
+UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY")
 TEST_URL = "https://api.ipify.org/"
+
+if not UPSTREAM_PROXY:
+    raise SystemExit("Set UPSTREAM_PROXY, for example: socks5://user:pass@proxy.example:1080")
 
 
 def main() -> None:

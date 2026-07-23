@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "proxy-relay"
 version = "1.3.0"
-description = "多协议代理中转器，支持HTTP/HTTPS/SOCKS5/SOCKS5H协议互转，本地代理无需账密认证"
+description = "Turn authenticated upstream HTTP/HTTPS/SOCKS5 proxies into local unauthenticated HTTP or SOCKS5 proxies."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "huazz233", email = "huazz233@163.com"}
@@ -18,20 +18,42 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Internet :: Proxy Servers",
     "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+requests = [
+    "requests[socks]>=2.25,<3",
+]
+examples = [
+    "requests[socks]>=2.25,<3",
+    "playwright>=1.40,<2; python_version >= '3.8'",
+    "selenium>=4,<5; python_version >= '3.8'",
+    "DrissionPage>=4,<5; python_version >= '3.8'",
+]
+test = [
+    "pytest>=7.4,<9",
+    "pytest-asyncio>=0.21,<2",
+]
+dev = [
+    "build>=1,<2",
+    "twine>=4,<7",
+    "pytest>=7.4,<9",
+    "pytest-asyncio>=0.21,<2",
 ]
 
 [project.urls]
 Homepage = "https://github.com/huazz233/proxy_relay"
 Repository = "https://github.com/huazz233/proxy_relay"
 Issues = "https://github.com/huazz233/proxy_relay/issues"
+Documentation = "https://github.com/huazz233/proxy_relay#readme"
 
 [tool.setuptools]
 packages = ["proxy_relay"]
@@ -39,3 +61,6 @@ packages = ["proxy_relay"]
 [tool.setuptools.package-data]
 proxy_relay = ["py.typed"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

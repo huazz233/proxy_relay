@@ -4,9 +4,11 @@ import asyncio
 from proxy_relay import create_proxy_async
 from playwright.async_api import ProxySettings, async_playwright
 
-UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY", "socks5://user:pass@proxy.com:1080")
+UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY")
 TEST_URL = "https://api.ipify.org/"
-print(UPSTREAM_PROXY)
+
+if not UPSTREAM_PROXY:
+    raise SystemExit("Set UPSTREAM_PROXY, for example: socks5://user:pass@proxy.example:1080")
 
 async def main() -> None:
     """Use Playwright with a local proxy created by proxy_relay."""

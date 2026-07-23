@@ -5,10 +5,13 @@ import requests
 
 from proxy_relay import create_proxy
 
-PROXY_ADDR = os.getenv("UPSTREAM_PROXY", "user:pass@proxy.example.com:1080")
+PROXY_ADDR = os.getenv("UPSTREAM_PROXY_ADDR")
 # TEST_URL = "http://208.95.112.1/json/"
 TEST_URL = "https://api.ipify.org/"
 TIMEOUT = 30
+
+if not PROXY_ADDR:
+    raise SystemExit("Set UPSTREAM_PROXY_ADDR without scheme, for example: user:pass@proxy.example:1080")
 
 
 def get_direct_ip():
